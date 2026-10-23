@@ -4,7 +4,7 @@ Muhit o'zgaruvchilari (.env):
   TELEGRAM_BOT_TOKEN  - @BotFather bergan token (majburiy)
   GEMINI_API_KEY      - Google AI Studio kaliti (majburiy)
   ALLOWED_USER_IDS    - ruxsat etilgan Telegram ID'lar, vergul bilan (bo'sh = hamma uchun ochiq)
-  GEMINI_MODEL        - model nomi (standart: gemini-2.5-flash)
+  GEMINI_MODEL        - model nomi (standart: gemini-3.8-flash)
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx URL'da bot tokenin
 log = logging.getLogger("linkbot")
 
 # ---------------------------------------------------------------- sozlamalar
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 MAX_URLS = 5                 # bitta xabardan ko'pi bilan nechta link
 GEMINI_TIMEOUT_S = 120       # YouTube tahlili uzoq davom etishi mumkin
 TG_LIMIT = 4096              # Telegram xabar uzunligi chegarasi
@@ -235,6 +235,8 @@ def friendly_error(exc: Exception) -> str:
         return "vaqt tugadi, keyinroq qayta urinib ko'ring"
     if "429" in s or "quota" in s or "resource_exhausted" in s:
         return "Gemini limiti tugadi, birozdan so'ng urinib ko'ring"
+    if "model" in s and ("not_found" in s or "no longer available" in s or "404" in s):
+        return "Gemini modeli eskirgan — GEMINI_MODEL sozlamasini yangilash kerak"
     if "api key" in s or "permission" in s or "403" in s:
         return "Gemini kaliti noto'g'ri yoki ruxsat yo'q"
     if "private" in s or "not found" in s or "404" in s:

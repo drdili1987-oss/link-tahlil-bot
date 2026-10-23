@@ -47,7 +47,7 @@ Kompyuterda `RENDER_EXTERNAL_URL` yo'q, shuning uchun bot oddiy polling rejimida
 `share.google`, `bit.ly`, `goo.gl`, `t.co` kabi havolalarni bot avval o'zi ochib, asl sahifani topadi va Gemini'ga shuni beradi.
 
 ## Sozlamalar
-- `GEMINI_MODEL` — model nomi (standart `gemini-2.5-flash`).
+- `GEMINI_MODEL` — model nomi (standart `gemini-3.8-flash`).
 - `bot.py` boshida: `MAX_URLS` (bir xabarda nechta link), `COOLDOWN_S` (so'rovlar orasidagi vaqt), `PROMPT` (tahlil formati).
 
 ## Test

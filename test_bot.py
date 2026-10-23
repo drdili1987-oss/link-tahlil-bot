@@ -109,3 +109,7 @@ def test_resolve_http_redirect_and_meta():
     assert a == "https://kun.uz/news/7"
     assert b == "https://gazeta.uz/x?a=1&b=2"
     assert e == "https://share.google/C" and n == "https://kun.uz/z"
+
+def test_friendly_model_error():
+    e = RuntimeError("404 NOT_FOUND. This model models/gemini-2.5-flash is no longer available to new users.")
+    assert "modeli eskirgan" in bot.friendly_error(e)
