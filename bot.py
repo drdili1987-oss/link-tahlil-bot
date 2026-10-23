@@ -34,11 +34,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx URL'da bot tokenin
 log = logging.getLogger("linkbot")
 
 # ---------------------------------------------------------------- sozlamalar
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")  # asosiy model band bo'lsa
-RETRY_DELAYS_S = (2, 5)      # vaqtinchalik xato (503/429/500) bo'lsa qayta urinishlar oralig'i
+# Navbat bilan sinaladigan modellar: birinchisi band yoki sekin bo'lsa, keyingisiga o'tiladi.
+MODELS = [m.strip() for m in os.getenv(
+    "GEMINI_MODELS", os.getenv("GEMINI_MODEL", "") or "gemini-3.6-flash,gemini-3.5-flash-lite,gemini-3.8-flash"
+).split(",") if m.strip()]
+MODEL = MODELS[0]
+RETRY_DELAYS_S = (2,)        # tez 503 bo'lsa shu modelning o'zida 1 marta qayta urinish
 MAX_URLS = 5                 # bitta xabardan ko'pi bilan nechta link
-GEMINI_TIMEOUT_S = 50        # bitta urinish uchun chegara (YouTube uchun alohida)
+GEMINI_TIMEOUT_S = 40        # bitta urinish uchun chegara (YouTube uchun alohida)
 YOUTUBE_TIMEOUT_S = 110
 TOTAL_BUDGET_S = 150         # bitta so'rov uchun barcha urinishlar jami — undan keyin to'xtaymiz
 PAGE_MAX_BYTES = 8_000_000   # bot o'zi yuklaydigan sahifa/PDF chegarasi
@@ -276,7 +279,7 @@ def parse_allowed(raw: str | None) -> set[int]:
 @dataclass
 class Analyzer:
     client: genai.Client
-    model: str = MODEL
+    models: list[str] = field(default_factory=lambda: list(MODELS))
 
     async def analyze(self, urls: list[str]) -> str:
         yt = [u for u in urls if is_youtube(u)]
@@ -342,32 +345,41 @@ class Analyzer:
         )
         return (resp.text or "").strip() or "Video tahlili bo'sh qaytdi."
 
-    async def _generate(self, contents, tools=None, timeout: float = GEMINI_TIMEOUT_S):
-        """Asosiy model bilan urinadi; band bo'lsa kutib qayta urinadi, keyin zaxira modelga o'tadi.
-        Jami vaqt TOTAL_BUDGET_S dan oshmaydi — foydalanuvchi cheksiz kutib qolmaydi."""
-        models = [self.model] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != self.model else [])
+    async def _generate(self, contents, tools=None, timeout: float | None = None):
+        """Modellarni navbat bilan sinaydi. Tez 503 bo'lsa shu modelda 1 marta qayta urinadi,
+        sekin (timeout) bo'lsa darhol keyingi modelga o'tadi. Jami vaqt TOTAL_BUDGET_S dan oshmaydi."""
+        timeout = timeout or GEMINI_TIMEOUT_S
         deadline = time.monotonic() + TOTAL_BUDGET_S
         last_exc: Exception | None = None
-        for model in models:
+        for model in self.models:
             config = types.GenerateContentConfig(tools=tools, temperature=0.3, thinking_config=thinking_for(model))
             for attempt in range(len(RETRY_DELAYS_S) + 1):
                 left = deadline - time.monotonic()
                 if left < 5:
                     raise last_exc or asyncio.TimeoutError()
+                t0 = time.monotonic()
                 try:
-                    return await asyncio.wait_for(
+                    resp = await asyncio.wait_for(
                         self.client.aio.models.generate_content(model=model, contents=contents, config=config),
                         timeout=min(timeout, left),
                     )
+                    log.info("Javob: %s, %.1fs", model, time.monotonic() - t0)
+                    return resp
                 except Exception as e:  # noqa: BLE001 — turini is_transient tekshiradi
                     last_exc = e
-                    if not is_transient(e):
+                    log.info("%s javob bermadi (%d-urinish, %.1fs): %r", model, attempt + 1, time.monotonic() - t0, e)
+                    if not is_transient(e) and not is_model_missing(e):
                         raise
-                    log.info("Gemini band/sekin (%s, %d-urinish): %r", model, attempt + 1, e)
+                    if isinstance(e, asyncio.TimeoutError) or is_model_missing(e):
+                        break  # sekin yoki mavjud emas — shu modelni qayta urinmaymiz
                     if attempt < len(RETRY_DELAYS_S):
                         await asyncio.sleep(RETRY_DELAYS_S[attempt])
-            log.warning("Model %s javob bermadi, zaxira modelga o'tiladi", model)
         raise last_exc  # type: ignore[misc]
+
+
+def is_model_missing(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return "model" in s and ("not_found" in s or "no longer available" in s or "is not found" in s)
 
 
 def is_transient(exc: Exception) -> bool:
@@ -501,12 +513,12 @@ def main() -> None:
     if base_url:
         secret = os.getenv("WEBHOOK_SECRET") or None
         port = int(os.getenv("PORT", "10000"))
-        log.info("Webhook rejimi: %s/webhook (port %s). Model: %s", base_url, port, MODEL)
+        log.info("Webhook rejimi: %s/webhook (port %s). Modellar: %s", base_url, port, MODELS)
         app.run_webhook(listen="0.0.0.0", port=port, url_path="webhook",
                         webhook_url=f"{base_url.rstrip('/')}/webhook", secret_token=secret,
                         allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     else:
-        log.info("Polling rejimi. Model: %s", MODEL)
+        log.info("Polling rejimi. Modellar: %s", MODELS)
         app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 

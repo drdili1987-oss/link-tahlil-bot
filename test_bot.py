@@ -135,26 +135,37 @@ def test_friendly_model_error():
 
 def test_retry_then_fallback(monkeypatch):
     _no_fetch(monkeypatch)
-    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
-    monkeypatch.setattr(bot, "FALLBACK_MODEL", "fallback-m")
+    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0,))
     used = []
     async def gen(model, contents, config):
         used.append(model)
-        if model != "fallback-m":
-            raise RuntimeError("503 UNAVAILABLE high demand")
+        if model == "a": raise RuntimeError("503 UNAVAILABLE high demand")
+        if model == "b": raise RuntimeError("404 NOT_FOUND model models/b is no longer available")
         return fake_resp("OK")
     client = MagicMock(); client.aio.models.generate_content = gen
-    out = asyncio.run(bot.Analyzer(client, model="main-m").analyze(["https://kun.uz"]))
-    assert out.startswith("OK") and used == ["main-m"] * 3 + ["fallback-m"]
+    out = asyncio.run(bot.Analyzer(client, models=["a", "b", "c"]).analyze(["https://kun.uz"]))
+    assert out.startswith("OK") and used == ["a", "a", "b", "c"]
+
+def test_timeout_skips_to_next(monkeypatch):
+    _no_fetch(monkeypatch)
+    monkeypatch.setattr(bot, "GEMINI_TIMEOUT_S", 0.2)
+    used = []
+    async def gen(model, contents, config):
+        used.append(model)
+        if model == "slow": await asyncio.sleep(5)
+        return fake_resp("FAST")
+    client = MagicMock(); client.aio.models.generate_content = gen
+    out = asyncio.run(bot.Analyzer(client, models=["slow", "fast"]).analyze(["https://kun.uz"]))
+    assert out == "FAST" and used == ["slow", "fast"]
 
 def test_non_transient_no_retry(monkeypatch):
     _no_fetch(monkeypatch)
-    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0,))
     used = []
     async def gen(model, contents, config):
         used.append(model); raise RuntimeError("403 PERMISSION_DENIED api key")
     client = MagicMock(); client.aio.models.generate_content = gen
-    out = asyncio.run(bot.Analyzer(client, model="main-m").analyze(["https://kun.uz"]))
+    out = asyncio.run(bot.Analyzer(client, models=["main-m", "x"]).analyze(["https://kun.uz"]))
     assert "kaliti" in out and used == ["main-m"]
 
 
@@ -184,6 +195,7 @@ def test_total_budget(monkeypatch):
     _no_fetch(monkeypatch)
     monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
     monkeypatch.setattr(bot, "TOTAL_BUDGET_S", 6)
+    monkeypatch.setattr(bot, "GEMINI_TIMEOUT_S", 3)
     async def gen(model, contents, config):
         await asyncio.sleep(10)
     client = MagicMock(); client.aio.models.generate_content = gen
