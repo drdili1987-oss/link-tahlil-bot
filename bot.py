@@ -16,7 +16,8 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from urllib.parse import parse_qs, urlparse
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from dotenv import load_dotenv
@@ -37,7 +38,13 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")  # asosiy model band bo'lsa
 RETRY_DELAYS_S = (2, 5)      # vaqtinchalik xato (503/429/500) bo'lsa qayta urinishlar oralig'i
 MAX_URLS = 5                 # bitta xabardan ko'pi bilan nechta link
-GEMINI_TIMEOUT_S = 120       # YouTube tahlili uzoq davom etishi mumkin
+GEMINI_TIMEOUT_S = 50        # bitta urinish uchun chegara (YouTube uchun alohida)
+YOUTUBE_TIMEOUT_S = 110
+TOTAL_BUDGET_S = 150         # bitta so'rov uchun barcha urinishlar jami — undan keyin to'xtaymiz
+PAGE_MAX_BYTES = 8_000_000   # bot o'zi yuklaydigan sahifa/PDF chegarasi
+PAGE_MAX_CHARS = 40_000      # Gemini'ga beriladigan matn chegarasi
+PAGE_MIN_CHARS = 400         # bundan kam matn chiqsa (JS sahifa) — Gemini o'zi ochishga urinadi
+TRACKING_PARAMS = ("utm_", "shem", "fbclid", "gclid", "yclid", "mc_", "igsh", "si")
 TG_LIMIT = 4096              # Telegram xabar uzunligi chegarasi
 COOLDOWN_S = 10              # bitta foydalanuvchi uchun so'rovlar orasidagi minimal vaqt
 
@@ -143,7 +150,7 @@ async def resolve_all(urls: list[str]) -> list[str]:
         return urls
     async with httpx.AsyncClient(follow_redirects=True, max_redirects=8, timeout=10,
                                  headers={"User-Agent": UA}) as client:
-        resolved = await asyncio.gather(*(resolve_url(u, client) for u in urls))
+        resolved = [clean_url(u) for u in await asyncio.gather(*(resolve_url(u, client) for u in urls))]
     out: list[str] = []
     for u in resolved:
         if u not in out:
@@ -165,6 +172,101 @@ def split_message(text: str, limit: int = TG_LIMIT) -> list[str]:
     if text:
         chunks.append(text)
     return chunks
+
+
+class _TextExtractor(HTMLParser):
+    SKIP = {"script", "style", "noscript", "svg", "nav", "footer", "header", "form", "iframe", "aside"}
+    BLOCK = {"p", "div", "br", "li", "h1", "h2", "h3", "h4", "tr", "section", "article"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.title = ""
+        self._skip = 0
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self._skip += 1
+        elif tag == "title":
+            self._in_title = True
+        elif tag in self.BLOCK:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self._skip:
+            self._skip -= 1
+        elif tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        elif not self._skip:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        raw = "".join(self.parts)
+        lines = (re.sub(r"[ \t\u00a0]+", " ", ln).strip() for ln in raw.splitlines())
+        return "\n".join(ln for ln in lines if len(ln) > 1)
+
+
+def clean_url(url: str) -> str:
+    """Kuzatuv parametrlarini (utm_*, shem, fbclid…) olib tashlaydi."""
+    p = urlparse(url)
+    if not p.query:
+        return url
+    keep = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)
+            if not k.lower().startswith(TRACKING_PARAMS)]
+    return urlunparse(p._replace(query=urlencode(keep)))
+
+
+@dataclass
+class Page:
+    url: str
+    title: str = ""
+    text: str = ""
+    pdf: bytes | None = None
+
+
+async def fetch_page(url: str, client: httpx.AsyncClient) -> Page | None:
+    """Sahifani bot o'zi yuklaydi. HTML -> toza matn, PDF -> baytlar. Uddalay olmasa None."""
+    try:
+        async with client.stream("GET", url) as resp:
+            if resp.status_code >= 400:
+                return None
+            ctype = resp.headers.get("content-type", "").lower()
+            if not ("html" in ctype or "pdf" in ctype or "text/plain" in ctype):
+                return None
+            body = bytearray()
+            async for chunk in resp.aiter_bytes():
+                body += chunk
+                if len(body) > PAGE_MAX_BYTES:
+                    return None
+        if "pdf" in ctype:
+            return Page(url, pdf=bytes(body))
+        enc = resp.encoding or "utf-8"
+        txt = bytes(body).decode(enc, "ignore")
+        if "text/plain" in ctype:
+            return Page(url, text=txt[:PAGE_MAX_CHARS]) if len(txt) >= PAGE_MIN_CHARS else None
+        ex = _TextExtractor()
+        ex.feed(txt)
+        text = ex.text()
+        if len(text) < PAGE_MIN_CHARS:
+            return None
+        return Page(url, title=html.unescape(ex.title).strip(), text=text[:PAGE_MAX_CHARS])
+    except (httpx.HTTPError, ValueError, LookupError) as e:
+        log.info("Sahifani o'zim ocholmadim %s: %r", url, e)
+        return None
+
+
+def thinking_for(model: str) -> types.ThinkingConfig | None:
+    # Tahlil uchun chuqur "o'ylash" shart emas — tezlik muhimroq
+    if model.startswith("gemini-3"):
+        return types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW)
+    if model.startswith("gemini-2.5-flash"):
+        return types.ThinkingConfig(thinking_budget=0)
+    return None
 
 
 def parse_allowed(raw: str | None) -> set[int]:
@@ -198,14 +300,30 @@ class Analyzer:
         return "\n\n━━━━━━━━━━\n\n".join(parts)
 
     async def _call_web(self, urls: list[str]) -> str:
-        resp = await self._generate(
-            contents=PROMPT + "\nManbalar:\n" + "\n".join(urls),
-            tools=[types.Tool(url_context=types.UrlContext())],
-        )
+        async with httpx.AsyncClient(follow_redirects=True, max_redirects=8, timeout=15,
+                                     headers={"User-Agent": UA, "Accept-Language": "uz,ru;q=0.8,en;q=0.7"}) as c:
+            pages = await asyncio.gather(*(fetch_page(u, c) for u in urls))
+        got = [p for p in pages if p]
+        missing = [u for u, p in zip(urls, pages) if not p]
+        log.info("Bot o'zi o'qidi: %d ta, Gemini'ga qoldi: %d ta", len(got), len(missing))
+
+        parts: list[types.Part] = [types.Part(text=PROMPT)]
+        for i, pg in enumerate(got, 1):
+            if pg.pdf is not None:
+                parts.append(types.Part(text=f"\nManba {i} (PDF): {pg.url}"))
+                parts.append(types.Part.from_bytes(data=pg.pdf, mime_type="application/pdf"))
+            else:
+                parts.append(types.Part(text=f"\nManba {i}: {pg.url}\nSarlavha: {pg.title}\nMatn:\n{pg.text}"))
+        tools = None
+        if missing:
+            parts.append(types.Part(text="\nQuyidagi manbalarni o'zing ochib o'qi:\n" + "\n".join(missing)))
+            tools = [types.Tool(url_context=types.UrlContext())]
+
+        resp = await self._generate(types.Content(role="user", parts=parts), tools=tools)
         text = (resp.text or "").strip()
 
         failed = []
-        meta = resp.candidates[0].url_context_metadata if resp.candidates else None
+        meta = resp.candidates[0].url_context_metadata if (missing and resp.candidates) else None
         for m in (meta.url_metadata if meta and meta.url_metadata else []):
             if m.url_retrieval_status != types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_SUCCESS:
                 failed.append(f"• {m.retrieved_url}: {USER_ERRORS.get(m.url_retrieval_status, 'ochilmadi')}")
@@ -220,33 +338,41 @@ class Analyzer:
                 types.Part(file_data=types.FileData(file_uri=url)),
                 types.Part(text=PROMPT + "\nManba: yuqoridagi YouTube video."),
             ]),
+            timeout=YOUTUBE_TIMEOUT_S,
         )
         return (resp.text or "").strip() or "Video tahlili bo'sh qaytdi."
 
-    async def _generate(self, contents, tools=None):
-        """Asosiy model bilan urinadi; vaqtinchalik xatoda kutib qayta urinadi, oxirida zaxira modelga o'tadi."""
-        config = types.GenerateContentConfig(tools=tools, temperature=0.3)
+    async def _generate(self, contents, tools=None, timeout: float = GEMINI_TIMEOUT_S):
+        """Asosiy model bilan urinadi; band bo'lsa kutib qayta urinadi, keyin zaxira modelga o'tadi.
+        Jami vaqt TOTAL_BUDGET_S dan oshmaydi — foydalanuvchi cheksiz kutib qolmaydi."""
         models = [self.model] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != self.model else [])
+        deadline = time.monotonic() + TOTAL_BUDGET_S
         last_exc: Exception | None = None
         for model in models:
+            config = types.GenerateContentConfig(tools=tools, temperature=0.3, thinking_config=thinking_for(model))
             for attempt in range(len(RETRY_DELAYS_S) + 1):
+                left = deadline - time.monotonic()
+                if left < 5:
+                    raise last_exc or asyncio.TimeoutError()
                 try:
                     return await asyncio.wait_for(
                         self.client.aio.models.generate_content(model=model, contents=contents, config=config),
-                        timeout=GEMINI_TIMEOUT_S,
+                        timeout=min(timeout, left),
                     )
                 except Exception as e:  # noqa: BLE001 — turini is_transient tekshiradi
                     last_exc = e
                     if not is_transient(e):
                         raise
+                    log.info("Gemini band/sekin (%s, %d-urinish): %r", model, attempt + 1, e)
                     if attempt < len(RETRY_DELAYS_S):
-                        log.info("Gemini band (%s), %ss dan keyin qayta: %s", model, RETRY_DELAYS_S[attempt], e)
                         await asyncio.sleep(RETRY_DELAYS_S[attempt])
-            log.warning("Model %s band, zaxira modelga o'tiladi", model)
+            log.warning("Model %s javob bermadi, zaxira modelga o'tiladi", model)
         raise last_exc  # type: ignore[misc]
 
 
 def is_transient(exc: Exception) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
     s = str(exc).lower()
     return any(k in s for k in ("503", "unavailable", "high demand", "overloaded", "500 internal", "429", "resource_exhausted"))
 
@@ -315,6 +441,9 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         urls = await resolve_all(urls)
         result = await st.analyzer.analyze(urls)
+    except Exception:
+        log.exception("Tahlilda kutilmagan xato")
+        result = "❌ Ichki xato yuz berdi. Qayta urinib ko'ring."
     finally:
         typing.cancel()
     if any(is_short(u) for u in urls):

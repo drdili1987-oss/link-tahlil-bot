@@ -1,4 +1,4 @@
-import asyncio, types as pytypes
+import asyncio, time, types as pytypes
 from unittest.mock import AsyncMock, MagicMock
 from google.genai import types
 import bot
@@ -34,24 +34,43 @@ def fake_resp(text, statuses=()):
     r = MagicMock(); r.text = text; r.candidates = [MagicMock(url_context_metadata=meta)]
     return r
 
-def test_analyze_mixed():
+def _no_fetch(monkeypatch):
+    async def none(url, client): return None
+    monkeypatch.setattr(bot, "fetch_page", none)
+
+def test_analyze_mixed(monkeypatch):
+    _no_fetch(monkeypatch)
     client = MagicMock()
     calls = []
     async def gen(model, contents, config):
         calls.append((contents, config))
-        if isinstance(contents, types.Content):
+        if isinstance(contents.parts[0].file_data, types.FileData):
             return fake_resp("VIDEO TAHLIL")
         return fake_resp("SAYT TAHLIL", [("https://ok.uz", types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_SUCCESS),
                                          ("https://pay.com", types.UrlRetrievalStatus.URL_RETRIEVAL_STATUS_PAYWALL)])
     client.aio.models.generate_content = gen
     out = asyncio.run(bot.Analyzer(client).analyze(["https://youtu.be/abc", "https://ok.uz", "https://pay.com"]))
     assert "VIDEO TAHLIL" in out and "SAYT TAHLIL" in out and "pay.com: pullik" in out
-    web = [c for c in calls if not isinstance(c[0], types.Content)][0]
-    assert web[1].tools[0].url_context is not None and "https://ok.uz" in web[0]
-    yt = [c for c in calls if isinstance(c[0], types.Content)][0]
+    web = [c for c in calls if c[0].parts[0].file_data is None][0]
+    assert web[1].tools[0].url_context is not None and "https://ok.uz" in web[0].parts[-1].text
+    yt = [c for c in calls if c[0].parts[0].file_data is not None][0]
     assert yt[0].parts[0].file_data.file_uri == "https://youtu.be/abc" and not yt[1].tools
+    assert web[1].thinking_config.thinking_level == types.ThinkingLevel.LOW
 
-def test_analyze_error():
+def test_analyze_own_fetch_no_tools(monkeypatch):
+    async def page(url, client): return bot.Page(url, title="Sarlavha X", text="Matn " * 200)
+    monkeypatch.setattr(bot, "fetch_page", page)
+    seen = {}
+    async def gen(model, contents, config):
+        seen["c"], seen["cfg"] = contents, config
+        return fake_resp("TAHLIL")
+    client = MagicMock(); client.aio.models.generate_content = gen
+    out = asyncio.run(bot.Analyzer(client).analyze(["https://kun.uz/a"]))
+    assert out == "TAHLIL" and not seen["cfg"].tools
+    assert "Sarlavha X" in seen["c"].parts[1].text
+
+def test_analyze_error(monkeypatch):
+    _no_fetch(monkeypatch)
     client = MagicMock()
     async def gen(**kw): raise RuntimeError("429 RESOURCE_EXHAUSTED quota")
     client.aio.models.generate_content = gen
@@ -115,6 +134,7 @@ def test_friendly_model_error():
     assert "modeli eskirgan" in bot.friendly_error(e)
 
 def test_retry_then_fallback(monkeypatch):
+    _no_fetch(monkeypatch)
     monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
     monkeypatch.setattr(bot, "FALLBACK_MODEL", "fallback-m")
     used = []
@@ -128,6 +148,7 @@ def test_retry_then_fallback(monkeypatch):
     assert out.startswith("OK") and used == ["main-m"] * 3 + ["fallback-m"]
 
 def test_non_transient_no_retry(monkeypatch):
+    _no_fetch(monkeypatch)
     monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
     used = []
     async def gen(model, contents, config):
@@ -135,3 +156,37 @@ def test_non_transient_no_retry(monkeypatch):
     client = MagicMock(); client.aio.models.generate_content = gen
     out = asyncio.run(bot.Analyzer(client, model="main-m").analyze(["https://kun.uz"]))
     assert "kaliti" in out and used == ["main-m"]
+
+
+def test_extract_and_clean():
+    ex = bot._TextExtractor()
+    ex.feed("<html><head><title>T &amp; Q</title><script>var x=1</script></head><body><nav>menu</nav><p>Birinchi gap.</p><p>Ikkinchi</p></body></html>")
+    assert ex.title == "T & Q" and "var x" not in ex.text() and "menu" not in ex.text() and "Birinchi gap." in ex.text()
+    assert bot.clean_url("https://9to5google.com/a/?shem=dsdf,x&utm_source=y&id=5") == "https://9to5google.com/a/?id=5"
+    assert bot.clean_url("https://kun.uz/a") == "https://kun.uz/a"
+
+def test_fetch_page_html_pdf_short():
+    import httpx
+    long = "<html><title>Yangilik</title><body>" + "<p>Bu juda muhim yangilik matni.</p>" * 30 + "</body></html>"
+    def h(req):
+        if req.url.path == "/html": return httpx.Response(200, headers={"content-type": "text/html; charset=utf-8"}, text=long)
+        if req.url.path == "/pdf": return httpx.Response(200, headers={"content-type": "application/pdf"}, content=b"%PDF-1.4 x")
+        if req.url.path == "/js": return httpx.Response(200, headers={"content-type": "text/html"}, text="<div id=app></div>")
+        return httpx.Response(404)
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+            return [await bot.fetch_page(f"https://x.uz/{p}", c) for p in ("html", "pdf", "js", "nope")]
+    a, b, js, nope = asyncio.run(run())
+    assert a.title == "Yangilik" and "muhim yangilik" in a.text
+    assert b.pdf.startswith(b"%PDF") and js is None and nope is None
+
+def test_total_budget(monkeypatch):
+    _no_fetch(monkeypatch)
+    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(bot, "TOTAL_BUDGET_S", 6)
+    async def gen(model, contents, config):
+        await asyncio.sleep(10)
+    client = MagicMock(); client.aio.models.generate_content = gen
+    t0 = time.monotonic()
+    out = asyncio.run(bot.Analyzer(client).analyze(["https://kun.uz"]))
+    assert time.monotonic() - t0 < 8 and "vaqt tugadi" in out
