@@ -34,6 +34,8 @@ log = logging.getLogger("linkbot")
 
 # ---------------------------------------------------------------- sozlamalar
 MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+FALLBACK_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.6-flash")  # asosiy model band bo'lsa
+RETRY_DELAYS_S = (2, 5)      # vaqtinchalik xato (503/429/500) bo'lsa qayta urinishlar oralig'i
 MAX_URLS = 5                 # bitta xabardan ko'pi bilan nechta link
 GEMINI_TIMEOUT_S = 120       # YouTube tahlili uzoq davom etishi mumkin
 TG_LIMIT = 4096              # Telegram xabar uzunligi chegarasi
@@ -222,17 +224,39 @@ class Analyzer:
         return (resp.text or "").strip() or "Video tahlili bo'sh qaytdi."
 
     async def _generate(self, contents, tools=None):
+        """Asosiy model bilan urinadi; vaqtinchalik xatoda kutib qayta urinadi, oxirida zaxira modelga o'tadi."""
         config = types.GenerateContentConfig(tools=tools, temperature=0.3)
-        return await asyncio.wait_for(
-            self.client.aio.models.generate_content(model=self.model, contents=contents, config=config),
-            timeout=GEMINI_TIMEOUT_S,
-        )
+        models = [self.model] + ([FALLBACK_MODEL] if FALLBACK_MODEL and FALLBACK_MODEL != self.model else [])
+        last_exc: Exception | None = None
+        for model in models:
+            for attempt in range(len(RETRY_DELAYS_S) + 1):
+                try:
+                    return await asyncio.wait_for(
+                        self.client.aio.models.generate_content(model=model, contents=contents, config=config),
+                        timeout=GEMINI_TIMEOUT_S,
+                    )
+                except Exception as e:  # noqa: BLE001 — turini is_transient tekshiradi
+                    last_exc = e
+                    if not is_transient(e):
+                        raise
+                    if attempt < len(RETRY_DELAYS_S):
+                        log.info("Gemini band (%s), %ss dan keyin qayta: %s", model, RETRY_DELAYS_S[attempt], e)
+                        await asyncio.sleep(RETRY_DELAYS_S[attempt])
+            log.warning("Model %s band, zaxira modelga o'tiladi", model)
+        raise last_exc  # type: ignore[misc]
+
+
+def is_transient(exc: Exception) -> bool:
+    s = str(exc).lower()
+    return any(k in s for k in ("503", "unavailable", "high demand", "overloaded", "500 internal", "429", "resource_exhausted"))
 
 
 def friendly_error(exc: Exception) -> str:
     s = str(exc).lower()
     if isinstance(exc, asyncio.TimeoutError):
         return "vaqt tugadi, keyinroq qayta urinib ko'ring"
+    if "503" in s or "unavailable" in s or "high demand" in s or "overloaded" in s:
+        return "Gemini hozir juda band, 1–2 daqiqadan so'ng qayta yuboring"
     if "429" in s or "quota" in s or "resource_exhausted" in s:
         return "Gemini limiti tugadi, birozdan so'ng urinib ko'ring"
     if "model" in s and ("not_found" in s or "no longer available" in s or "404" in s):

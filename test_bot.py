@@ -113,3 +113,25 @@ def test_resolve_http_redirect_and_meta():
 def test_friendly_model_error():
     e = RuntimeError("404 NOT_FOUND. This model models/gemini-2.5-flash is no longer available to new users.")
     assert "modeli eskirgan" in bot.friendly_error(e)
+
+def test_retry_then_fallback(monkeypatch):
+    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
+    monkeypatch.setattr(bot, "FALLBACK_MODEL", "fallback-m")
+    used = []
+    async def gen(model, contents, config):
+        used.append(model)
+        if model != "fallback-m":
+            raise RuntimeError("503 UNAVAILABLE high demand")
+        return fake_resp("OK")
+    client = MagicMock(); client.aio.models.generate_content = gen
+    out = asyncio.run(bot.Analyzer(client, model="main-m").analyze(["https://kun.uz"]))
+    assert out.startswith("OK") and used == ["main-m"] * 3 + ["fallback-m"]
+
+def test_non_transient_no_retry(monkeypatch):
+    monkeypatch.setattr(bot, "RETRY_DELAYS_S", (0, 0))
+    used = []
+    async def gen(model, contents, config):
+        used.append(model); raise RuntimeError("403 PERMISSION_DENIED api key")
+    client = MagicMock(); client.aio.models.generate_content = gen
+    out = asyncio.run(bot.Analyzer(client, model="main-m").analyze(["https://kun.uz"]))
+    assert "kaliti" in out and used == ["main-m"]
