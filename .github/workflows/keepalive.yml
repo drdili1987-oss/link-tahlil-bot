@@ -3,9 +3,9 @@
 # Kechasi uxlashiga ruxsat: hisobdagi 750 soat/oy ikkala botga yetishi uchun
 # (15 soat x 31 kun ~ 465 soat; qolgani kirish-test-botga).
 name: keepalive
+# GitHub cron ishonchsiz chiqdi (soatlab kechikdi). Endi uyg'otish Supabase pg_cron'da:
+# Toshkent 09:00-20:00, har 10 daqiqada. Bu workflow faqat qo'lda ishga tushirish uchun.
 on:
-  schedule:
-    - cron: "*/5 3-17 * * *"
   workflow_dispatch:
 jobs:
   ping:
