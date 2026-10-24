@@ -202,3 +202,27 @@ def test_total_budget(monkeypatch):
     t0 = time.monotonic()
     out = asyncio.run(bot.Analyzer(client).analyze(["https://kun.uz"]))
     assert time.monotonic() - t0 < 8 and "vaqt tugadi" in out
+
+
+def test_x_post_and_js_stub():
+    import httpx
+    stub = "<html><body><p>JavaScript is not available.</p>" + "<p>Help Center Terms of Service Privacy Policy</p>" * 20 + "</body></html>"
+    tweet = {"code": 200, "tweet": {"text": "Gemini 4 chiqdi", "created_at": "Fri Oct 23",
+             "author": {"name": "Google DeepMind", "screen_name": "GoogleDeepMind"}, "likes": 10,
+             "quote": {"text": "Eski post", "author": {"name": "G", "screen_name": "g"}}}}
+    def h(req):
+        if req.url.host == "api.fxtwitter.com":
+            return httpx.Response(200, json=tweet) if req.url.path.endswith("/1") else httpx.Response(404)
+        if req.url.host == "publish.twitter.com":
+            return httpx.Response(200, json={"author_name": "A", "html": "<blockquote><p>oEmbed matn</p></blockquote>"})
+        return httpx.Response(200, headers={"content-type": "text/html"}, text=stub)
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(h)) as c:
+            return (await bot.fetch_page("https://x.com/GoogleDeepMind/status/1?s=20", c),
+                    await bot.fetch_page("https://twitter.com/a/status/2", c),
+                    await bot.fetch_page("https://example.com/js", c))
+    a, b, js = asyncio.run(run())
+    assert "Gemini 4 chiqdi" in a.text and "@GoogleDeepMind" in a.text and "Eski post" in a.text
+    assert "oEmbed matn" in b.text
+    assert js is None
+    assert bot.x_status_id("https://x.com/home") is None

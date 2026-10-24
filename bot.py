@@ -58,6 +58,11 @@ SHORT_HOSTS = {"share.google", "g.co", "goo.gl", "maps.app.goo.gl", "search.app"
                "tinyurl.com", "cutt.ly", "is.gd", "clck.ru", "vk.cc", "rb.gy", "shorturl.at", "ow.ly", "lnkd.in"}
 REDIRECT_PARAMS = ("url", "q", "u", "link", "target")
 META_REFRESH_RE = re.compile(r"""(?:url=|href=["']|location(?:\.href)?\s*=\s*["'])\s*(https?://[^"'\s<>;]+)""", re.I)
+X_HOSTS = {"x.com", "www.x.com", "mobile.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+X_STATUS_RE = re.compile(r"/status(?:es)?/(\d+)")
+# JS'siz ochilmaydigan sahifalarning "zaglushka" matni — bunday sahifani "o'qildi" deb hisoblamaymiz.
+JS_STUB_RE = re.compile(r"javascript is (?:not available|disabled)|enable javascript|"
+                        r"включите javascript|javascript.{0,20}(?:yoqing|o'chirilgan)", re.I)
 UA = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0 Mobile Safari/537.36"
 
 PROMPT = """Sen tahlilchi yordamchisan. Quyidagi manba(lar) ichidagi ma'lumotni o'qib, o'zbek tilida (lotin yozuvida) qisqa tahlil yoz.
@@ -232,8 +237,60 @@ class Page:
     pdf: bytes | None = None
 
 
+def x_status_id(url: str) -> str | None:
+    p = urlparse(url)
+    if (p.hostname or "").lower() not in X_HOSTS:
+        return None
+    m = X_STATUS_RE.search(p.path)
+    return m.group(1) if m else None
+
+
+def _x_text(t: dict) -> str:
+    a = t.get("author") or {}
+    lines = [f"Muallif: {a.get('name', '')} (@{a.get('screen_name', '')})", f"Sana: {t.get('created_at', '')}",
+             "Post matni:", t.get("text") or ""]
+    art = t.get("article") or {}
+    if art.get("title") or art.get("preview_text"):
+        lines += ["Maqola:", art.get("title") or "", art.get("preview_text") or ""]
+    media = (t.get("media") or {}).get("all") or []
+    if media:
+        lines.append("Media: " + ", ".join(f"{m.get('type', 'media')}" + (f" ({m['altText']})" if m.get("altText") else "")
+                                           for m in media))
+    stats = {k: t.get(k) for k in ("views", "likes", "retweets", "replies") if t.get(k) is not None}
+    if stats:
+        lines.append("Statistika: " + ", ".join(f"{k} {v}" for k, v in stats.items()))
+    q = t.get("quote")
+    if q:
+        lines += ["", "Iqtibos qilingan post:", _x_text(q)]
+    return "\n".join(ln for ln in lines if ln is not None)
+
+
+async def fetch_x_post(url: str, status_id: str, client: httpx.AsyncClient) -> Page | None:
+    """X (Twitter) sahifasi JS'siz bo'sh keladi — post matnini ochiq API (fxtwitter) orqali olamiz."""
+    try:
+        r = await client.get(f"https://api.fxtwitter.com/status/{status_id}")
+        if r.status_code == 200:
+            t = (r.json() or {}).get("tweet")
+            if t and (t.get("text") or t.get("article") or t.get("media")):
+                a = t.get("author") or {}
+                return Page(url, title=f"X post: @{a.get('screen_name', '')}", text=_x_text(t)[:PAGE_MAX_CHARS])
+        # Zaxira: rasmiy oEmbed (faqat matn, statistikasiz)
+        r = await client.get("https://publish.twitter.com/oembed", params={"url": url, "omit_script": "1"})
+        if r.status_code == 200:
+            d = r.json()
+            ex = _TextExtractor()
+            ex.feed(d.get("html", ""))
+            if ex.text().strip():
+                return Page(url, title=f"X post: {d.get('author_name', '')}", text=ex.text()[:PAGE_MAX_CHARS])
+    except (httpx.HTTPError, ValueError) as e:
+        log.info("X postini ocholmadim %s: %r", url, e)
+    return None
+
+
 async def fetch_page(url: str, client: httpx.AsyncClient) -> Page | None:
     """Sahifani bot o'zi yuklaydi. HTML -> toza matn, PDF -> baytlar. Uddalay olmasa None."""
+    if sid := x_status_id(url):
+        return await fetch_x_post(url, sid, client)
     try:
         async with client.stream("GET", url) as resp:
             if resp.status_code >= 400:
@@ -255,7 +312,7 @@ async def fetch_page(url: str, client: httpx.AsyncClient) -> Page | None:
         ex = _TextExtractor()
         ex.feed(txt)
         text = ex.text()
-        if len(text) < PAGE_MIN_CHARS:
+        if len(text) < PAGE_MIN_CHARS or (len(text) < 3000 and JS_STUB_RE.search(text)):
             return None
         return Page(url, title=html.unescape(ex.title).strip(), text=text[:PAGE_MAX_CHARS])
     except (httpx.HTTPError, ValueError, LookupError) as e:
